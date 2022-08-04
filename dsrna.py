@@ -26,7 +26,10 @@ parser.add_argument('-s', '--sample_sheet', type=cmder.filename, help='Path to s
 parser.add_argument('-g', '--genome', type=cmder.dirname,
                     help='Path to STAR genome index directory, optional, default: %(default)s.',
                     default='/project/xchen/genome/mouse/star.index')
-parser.add_argument('-t', '--gtf', type=cmder.filename,
+parser.add_argument('-t', '--genome_gtf', type=cmder.filename,
+                    help='Path to genome GTF file, optional, default: %(default)s.',
+                    default='/project/xchen/genome/mouse/GRCm38.p5.gencode.vM16.primary_assembly.annotation.gtf')
+parser.add_argument('-T', '--te_gtf', type=cmder.filename,
                     help='Path to TE GTF file, optional, default: %(default)s.',
                     default='/project/xchen/genome/mouse/GRCm38_GENCODE_rmsk_TE.gtf')
 parser.add_argument('-o', '--outdir', help='Path to output directory, optional, default: current working directory.')
@@ -96,61 +99,139 @@ def qc_and_cut_adapter(fastq, out):
               exit_on_error=True, debug=args.debug, pmt=args.debug)
     
     
-@task(inputs=qc_and_cut_adapter, outputs=lambda i: i.replace('.r2.fastq.gz', '.unique.r1.fastq.gz'))
+@task(inputs=qc_and_cut_adapter, outputs=lambda i: i.replace('.r1.fastq.gz', '.unique.r1.fastq.gz'))
 def deduplicate_fastq(fastq, out):
     r2, out2 = fastq.replace('.r1.', '.r2.'), out.replace('.r1.', '.r2.')
     cmd = f'fastuniq -i {fastq} {r2} -o {out} -p {out2}'
     cmder.run(cmd, msg=f'Running duplicates from {fastq} ...', exit_on_error=True, debug=args.debug, pmt=args.debug)
 
 
-@task(inputs=deduplicate_fastq, outputs=lambda i: i.replace('.unique.r1.fastq.gz', '.bam'))
-def align_reads_to_genome(fastq, bam):
-    prefix = f'{fastq.replace(".unique.r1.fastq.gz", ".star.genome.map")}'
-    n = sum([int(os.path.exists(f'{uid}.bam')) for uid in IDS])
+@task(inputs=deduplicate_fastq, outputs=lambda i: i.replace('.unique.r1.fastq.gz', '.te.bam'))
+def map_reads_to_te(fastq, bam):
+    prefix = f'{fastq.replace(".unique.r1.fastq.gz", ".star.te.map")}'
+    n = sum([int(os.path.exists(f'{uid}.te.bam')) for uid in IDS])
     genome_load = 'LoadAndRemove' if n == len(args.fastq) - 1 else 'LoadAndKeep'
     try:
         cmder.run(f'[ -d {prefix} ] || mkdir {prefix}')
         cmd = ['STAR',
                '--runMode', 'alignReads',
-               '--quantMode', 'GeneCounts',
-               '--alignEndsType', 'EndToEnd',
                '--runThreadN', args.cpus,
+               '--alignEndsType', 'EndToEnd',
                '--genomeDir', args.genome,
                '--genomeLoad', genome_load,
+               '--outBAMcompression', 10,
                '--outFileNamePrefix', f"{prefix}/",
-               '--outSAMtype', 'BAM', 'Unsorted',
-               '--readFilesCommand', 'zcat',
-               '--outSAMunmapped', 'None',
-               '--outFilterMultimapNmax', 1000,
+               '--outFilterMultimapNmax', 100,
+               '--outFilterMultimapScoreRange', 1,
                '--outSAMmultNmax', 1,
+               '--outFilterScoreMin', 10,
+               '--outFilterType', 'BySJout',
+               '--outReadsUnmapped', 'Fastx',
+               '--outSAMattrRGline', 'ID:foo',
                '--outSAMattributes', 'All',
-               '--outMultimapperOrder', 'Random',
-               '--winAnchorMultimapNmax', 1000,
+               '--outSAMmode', 'Full',
+               '--outSAMtype', 'BAM', 'Unsorted',
+               '--outSAMunmapped', 'None',
+               '--outStd', 'Log',
+               '--readFilesCommand', 'zcat',
                '--readMapNumber', 1_000_000 if args.debug else -1,
                '--readFilesIn', fastq, fastq.replace('.r1.fastq.gz', '.r2.fastq.gz'),
                '>', '/dev/null']
-        cmder.run(cmd, msg=f'Align reads in {fastq} to reference genome ...',
-                  exit_on_error=True, pmt=args.debug, debug=args.debug)
+        cmder.run(cmd, msg=f'Mapping reads in {fastq} to TE ...', exit_on_error=True, pmt=args.debug, debug=args.debug)
         cmder.run(f'mv {prefix}/Log.final.out {prefix}.log')
         cmder.run(f'samtools sort -@ {args.cpus} -m 2G -o {bam} {prefix}/Aligned.out.bam', debug=args.debug)
         cmder.run(f'samtools index {bam}')
-        cmder.run(f'mv {prefix}/ReadsPerGene.out.tab {bam[:-4]}.reads.per.gene.tsv')
+        cmder.run(f'mv {prefix}/Unmapped.out.mate1 {bam[:-7]}.te.unmap.r1.fastq')
+        cmder.run(f'mv {prefix}/Unmapped.out.mate2 {bam[:-7]}.te.unmap.r2.fastq')
     finally:
         if args.debug:
             pass
         else:
             cmder.run(f'rm -r {prefix}')
+
+
+@task(inputs=[], parent=deduplicate_fastq, outputs=[f'{uid}.bam' for uid in IDS])
+def map_reads_to_genome(fastq, bam):
+    prefix = f'{bam[:-4]}.genome.map'
+    n = sum([int(os.path.exists(f'{name}.bam')) for name in IDS])
+    genome_load = 'LoadAndRemove' if n == len(FASTQS) - 1 else 'LoadAndKeep'
+    try:
+        cmder.run(f'[ -d {prefix} ] || mkdir {prefix}')
+        cmd = ['STAR',
+               '--runMode', 'alignReads',
+               '--runThreadN', args.cpus,
+               '--alignEndsType', 'EndToEnd',
+               '--genomeDir', args.genome,
+               '--genomeLoad', genome_load,
+               '--outBAMcompression', 10,
+               '--outFileNamePrefix', f"{prefix}/",
+               '--outFilterMultimapNmax', 1,
+               '--outFilterMultimapScoreRange', 1,
+               '--outFilterScoreMin', 10,
+               '--outFilterType', 'BySJout',
+               '--outReadsUnmapped', 'Fastx',
+               '--outSAMattrRGline', 'ID:foo',
+               '--outSAMattributes', 'All',
+               '--outSAMmode', 'Full',
+               '--outSAMtype', 'BAM', 'Unsorted',
+               '--outSAMunmapped', 'None',
+               '--outStd', 'Log',
+               '--readFilesIn', f'{bam[:-4]}.te.unmap.r1.fastq', f'{bam[:-4]}.te.unmap.r2.fastq']
+        
+        cmder.run(cmd, msg=f'Map repeat elements unmapped reads in {mate} to reference genome ...',
+                  pmt=True, debug=args.debug)
+        cmder.run(f'mv {prefix}/Log.final.out {bam.replace(".genome.map.bam", ".genome.map.log")}')
+        cmder.run(f'samtools sort -@ {args.cpus} -m 2G -o {bam} {prefix}/Aligned.out.bam', debug=args.debug)
+        cmder.run(f'samtools index {bam}')
+    finally:
+        if args.debug or args.keep:
+            pass
+        else:
+            cmder.run(f'rm -r {prefix}')
             
             
-@task(inputs=[], outputs=['feature.count.csv'], parent=align_reads_to_genome)
+@task(inputs=[], outputs=['te.feature.count.csv'], parent=map_reads_to_te)
 def te_feature_count(inputs, outputs):
+    bam, out = ' '.join([f'{uid}.te.bam' for uid in IDS]), 'featureCounts'
+    cmd = f'featureCounts -M -p --countReadPairs -s 2 -T -a {args.te_gtf} {args.cpus} -o {out} {bam}'
+    cmder.run(cmd, msg=f'Counting TE features ...', exit_on_error=True, debug=args.debug, pmt=args.debug)
+    df = pd.read_csv(out, usecols=lambda c: c == 'Geneid' or c.endswith('bam'), comment='#', dtype=str)
+    df = df.rename(columns={c: os.path.basename(c).replace('.bam', '') for c in df.columns})
+    df.to_csv(outputs, index=False)
+    cmder.run(f'mv {out} te.feature.count.tsv')
+    cmder.run(f'mv {out}.summary te.feature.count.summary')
+
+
+@task(inputs=[], outputs=['genome.feature.count.csv'], parent=map_reads_to_genome)
+def genome_feature_count(inputs, outputs):
     bam, out = ' '.join([f'{uid}.bam' for uid in IDS]), 'featureCounts'
-    cmd = f'featureCounts -p -M -F GTF -a {args.gtf} -s 0 -T {args.cpus} -o {out} {bam}'
+    cmd = f'featureCounts -p --countReadPairs --primary -s 2 -T -a {args.genome_gtf} {args.cpus} -o {out} {bam}'
     cmder.run(cmd, msg=f'Counting features ...', exit_on_error=True, debug=args.debug, pmt=args.debug)
     df = pd.read_csv(out, usecols=lambda c: c == 'Geneid' or c.endswith('bam'), comment='#', dtype=str)
     df = df.rename(columns={c: os.path.basename(c).replace('.bam', '') for c in df.columns})
     df.to_csv(outputs, index=False)
-            
+    cmder.run(f'mv {out} genome.feature.count.tsv')
+    cmder.run(f'mv {out}.summary genome.feature.count.summary')
+
+
+@task(inputs=map_reads_to_genome, outputs=lambda i: i.replace('.bam', '.bw'))
+def bam_to_bw(bam, bw):
+    cmd = f'bamCoverage --numberOfProcessors {args.cpus} --effectiveGenomeSize 2652783500 ' \
+          f'-b {bam} --normalizeUsing CPM -o {bw}'
+    cmder.run(cmd, msg=f'Making {bw} using {bam} ...')
+
+
+@task(inputs=[], parent=bam_to_bw, outputs=['session.xml'])
+def session(inputs, outputs):
+    resources, tracks = [], []
+    for uid in IDS:
+        bam, bw = f'{uid}.bam', f'{uid}.bam'
+        resources.append(RESOURCE.format(bw=bw))
+        tracks.append(TRACK.format(bw=bw, name=uid.replace('_', ' ')))
+    
+    with open(outputs, 'w') as o:
+        o.write(XML.format(resources='\n'.join(resources), tracks='\n'.join(tracks)))
+        
       
 # @task(inputs=[], parent=align_reads_to_genome, outputs=['qc.summary.csv'])
 def qc_summary(inputs, outputs):
@@ -272,7 +353,7 @@ def qc_summary(inputs, outputs):
 
 def cleanup():
     logger.info('Cleaning up ...')
-    cmder.run(f"rm {' '.join([f'{uid}.*.fastq.gz' for uid in IDS])} || true")
+    cmder.run(f"rm {' '.join([f'{uid}.*.fastq*' for uid in IDS])} || true")
 
 
 @logger.catch()
@@ -280,8 +361,8 @@ def main():
     try:
         flow = Flow('dsrna.te', description=__doc__.strip())
         flow.run(dry_run=args.dryrun, cpus=args.cpus)
-        # if not args.debug and not args.dryrun:
-        #     cleanup()
+        if not args.debug and not args.dryrun:
+            cleanup()
         if not args.dryrun:
             logger.info('Mission accomplished!')
     finally:
